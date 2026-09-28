@@ -19,7 +19,7 @@ AI-powered classification from North Sea seismic data — run this quickstart wi
   - [Roles](#roles)
   - [Clone the repository](#clone-the-repository)
   - [Set your deployment namespace](#set-your-deployment-namespace)
-  - [Enable TEE in server firmware and kernel parameters](#hardware-prerequisite-enable-tee-in-server-firmware-and-kernel-parameters)
+  - [Enable TEE in server firmware and kernel parameters](#enable-tee-in-server-firmware-and-kernel-parameters)
   - [Kata containers setup — application deployer (cluster-admin, once per cluster)](#kata-containers-setup--application-deployer-cluster-admin-once-per-cluster)
   - [Intel TDX Quote Generation Service setup — application deployer (cluster-admin, once per cluster, Intel TDX only)](#intel-tdx-quote-generation-service-setup--application-deployer-cluster-admin-once-per-cluster-intel-tdx-only)
   - [Trustee setup — model owner (cluster-admin, once per cluster)](#trustee-setup--model-owner-cluster-admin-once-per-cluster)
@@ -361,7 +361,7 @@ NODE=$(oc get nodes -l 'node-role.kubernetes.io/worker,!node-role.kubernetes.io/
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
     oc get nodes -l node-role.kubernetes.io/worker \
     -o jsonpath='{.items[0].metadata.name}')
-oc debug node/$NODE -- chroot /host dmesg | grep -i tdx
+oc debug node/$NODE -- chroot /host journalctl -k | grep -i tdx
 ```
 
 Expected output includes `virt/tdx: BIOS enabled` and `virt/tdx: module initialized`. If you see no tdx lines, the BIOS settings were not saved correctly.
@@ -380,7 +380,7 @@ NODE=$(oc get nodes -l 'node-role.kubernetes.io/worker,!node-role.kubernetes.io/
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
     oc get nodes -l node-role.kubernetes.io/worker \
     -o jsonpath='{.items[0].metadata.name}')
-oc debug node/$NODE -- chroot /host dmesg | grep -i snp
+oc debug node/$NODE -- chroot /host journalctl -k | grep -i snp
 ```
 
 #### Apply kernel parameters
@@ -481,7 +481,7 @@ To validate all hardware and software prerequisites before proceeding:
 make check-prereqs
 ```
 
-Verify that output indicates that everything is installed as expected:
+Sample output:
 ```
 === Local tools ===
   [PASS] oc found: /usr/local/bin/oc
@@ -499,7 +499,7 @@ Verify that output indicates that everything is installed as expected:
   [PASS] Node architecture: x86_64 (amd64)
 
 === CPU TEE capability ===
-  Checking dmesg on rh34-jharmiso-mig-0630-gpu01 (spawns a debug pod ? takes ~30s)...
+  Checking kernel journal on rh34-jharmiso-mig-0630-gpu01 (spawns a debug pod ? takes ~30s)...
   [PASS] Intel TDX: BIOS enabled ? BIOS enabled: private KeyID range [16, 64)
   [PASS] Intel TDX: kernel initialized ? TDX active
   [PASS] Intel TDX: NFD label intel.feature.node.kubernetes.io/tdx confirmed
@@ -524,7 +524,7 @@ Verify that output indicates that everything is installed as expected:
   PASS: 24   FAIL: 0   WARN: 0
 ```
 
-Make sure that all checks pass before moving to the next section.
+At this point, reports that Node Feature Discovery (NFD), OpenShift Sandboxed Containers (OSC), Trustee, or the Intel TDX DCAP components are not installed are expected. They are installed in later setup steps, so you can ignore those specific reports for now. Resolve other failures before proceeding.
 
 ---
 
@@ -1790,6 +1790,14 @@ oc rollout status deployment/trustee-deployment -n trustee-operator-system --tim
 </details>
 
 ---
+
+After completing Kata setup, Intel TDX DCAP setup (Intel TDX only), and Trustee setup, run the prerequisite check again before deploying the application:
+
+```bash
+make check-prereqs
+```
+
+At this point, all applicable checks should pass. On AMD SEV-SNP clusters, Intel TDX DCAP and TDX MachineConfig warnings are not applicable. Resolve any remaining failures before proceeding.
 
 ### Application deployment — application deployer (namespace admin)
 
