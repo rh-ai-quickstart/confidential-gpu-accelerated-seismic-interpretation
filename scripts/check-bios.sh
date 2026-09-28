@@ -51,7 +51,7 @@ BIOS_VERSION=$(run_on_node "sudo dmidecode -s bios-version")
 BIOS_DATE=$(run_on_node "sudo dmidecode -s bios-release-date")
 CPU_VENDOR=$(run_on_node "grep -m1 vendor_id /proc/cpuinfo | awk '{print \$3}'")
 CPU_FLAGS=$(run_on_node "grep -m1 flags /proc/cpuinfo")
-DMESG=$(run_on_node "dmesg")
+KERNEL_LOG=$(run_on_node "sudo journalctl -k")
 KERNEL_CMDLINE=$(run_on_node "cat /proc/cmdline")
 
 echo "  CPU: ${CPU_VENDOR:-unknown}"
@@ -87,14 +87,14 @@ if [[ "$TEE_TYPE" == "tdx" ]]; then
     print_result "IOMMU" "intel_iommu=on not in cmdline" "WARN"
   fi
 
-  TME_STATUS=$(echo "$DMESG" | grep "x86/tme:" | head -1)
+  TME_STATUS=$(echo "$KERNEL_LOG" | grep "x86/tme:" | head -1)
   if echo "$TME_STATUS" | grep -q "enabled by BIOS"; then
     print_result "TME" "enabled by BIOS" "OK"
   else
     print_result "TME" "not enabled by BIOS" "FAIL"
   fi
 
-  MKTME_STATUS=$(echo "$DMESG" | grep "x86/mktme:" | head -2)
+  MKTME_STATUS=$(echo "$KERNEL_LOG" | grep "x86/mktme:" | head -2)
   MKTME_KEYS=$(echo "$MKTME_STATUS" | grep -oP '\d+ KeyIDs' | awk '{print $1}')
   if echo "$MKTME_STATUS" | grep -q "enabled by BIOS"; then
     print_result "MKTME" "enabled by BIOS (${MKTME_KEYS:-0} KeyIDs)" "OK"
@@ -104,20 +104,20 @@ if [[ "$TEE_TYPE" == "tdx" ]]; then
     print_result "MKTME" "not detected" "FAIL"
   fi
 
-  if echo "$DMESG" | grep -q "x86/mktme: No known encryption algorithm"; then
+  if echo "$KERNEL_LOG" | grep -q "x86/mktme: No known encryption algorithm"; then
     print_result "CPU PA limit" "MKTME algorithm reports 0x0 (check LimitCPUPAto46bits)" "FAIL"
   else
     print_result "CPU PA limit" "unrestricted" "OK"
   fi
 
-  TDX_BIOS=$(echo "$DMESG" | grep "virt/tdx:" | head -1)
+  TDX_BIOS=$(echo "$KERNEL_LOG" | grep "virt/tdx:" | head -1)
   TDX_KEYID_RANGE=$(echo "$TDX_BIOS" | grep -oP 'private KeyID range \[[0-9]+, [0-9]+\)')
   if echo "$TDX_BIOS" | grep -q "BIOS enabled"; then
     print_result "TDX" "BIOS enabled, $TDX_KEYID_RANGE" "OK"
-  elif echo "$DMESG" | grep -q "no TDX private KeyIDs"; then
+  elif echo "$KERNEL_LOG" | grep -q "no TDX private KeyIDs"; then
     print_result "TDX" "no private KeyIDs available" "FAIL"
   else
-    print_result "TDX" "not detected in dmesg" "FAIL"
+    print_result "TDX" "not detected in kernel journal" "FAIL"
   fi
 
   if echo "$CPU_FLAGS" | grep -qw "sgx"; then
@@ -134,15 +134,15 @@ if [[ "$TEE_TYPE" == "tdx" ]]; then
       print_result "kvm_intel" "loaded but tdx=${TDX_PARAM:-N}" "FAIL"
     fi
   else
-    if echo "$DMESG" | grep -q "no TDX private KeyIDs"; then
+    if echo "$KERNEL_LOG" | grep -q "no TDX private KeyIDs"; then
       print_result "kvm_intel" "not loaded (no TDX KeyIDs — check BIOS)" "FAIL"
     else
       print_result "kvm_intel" "not loaded" "FAIL"
     fi
   fi
 
-  TDX_MODULE=$(echo "$DMESG" | grep "TDX module" | sed 's/.*TDX module //')
-  TDX_INIT=$(echo "$DMESG" | grep -c "tdx: module initialized")
+  TDX_MODULE=$(echo "$KERNEL_LOG" | grep "TDX module" | sed 's/.*TDX module //')
+  TDX_INIT=$(echo "$KERNEL_LOG" | grep -c "tdx: module initialized")
   if [[ -n "$TDX_MODULE" ]]; then
     TDX_VER=$(echo "$TDX_MODULE" | awk -F'[, ]' '{print $1}')
     TDX_MIN="1.5.16"
@@ -155,21 +155,21 @@ if [[ "$TEE_TYPE" == "tdx" ]]; then
       print_result "TDX module" "$TDX_MODULE" "OK"
     fi
   else
-    print_result "TDX module" "not found in dmesg" "FAIL"
+    print_result "TDX module" "not found in kernel journal" "FAIL"
   fi
 
 elif [[ "$TEE_TYPE" == "snp" ]]; then
-  if echo "$DMESG" | grep -qi "AMD-Vi\|IOMMU"; then
+  if echo "$KERNEL_LOG" | grep -qi "AMD-Vi\|IOMMU"; then
     print_result "IOMMU" "AMD-Vi detected" "OK"
   else
     print_result "IOMMU" "AMD-Vi not detected" "WARN"
   fi
 
-  SEV_INFO=$(echo "$DMESG" | grep -i "SEV-SNP" | head -1)
+  SEV_INFO=$(echo "$KERNEL_LOG" | grep -i "SEV-SNP" | head -1)
   if [[ -n "$SEV_INFO" ]]; then
     print_result "SEV-SNP" "${SEV_INFO##*] }" "OK"
   else
-    print_result "SEV-SNP" "not detected in dmesg" "FAIL"
+    print_result "SEV-SNP" "not detected in kernel journal" "FAIL"
   fi
 
   if run_on_node "[ -e /dev/sev ]"; then

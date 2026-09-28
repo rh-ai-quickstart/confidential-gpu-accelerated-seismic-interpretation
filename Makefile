@@ -234,6 +234,8 @@ check-prereqs:
 	for tool in oc helm cosign openssl curl base64 python3; do \
 	    if command -v $$tool >/dev/null 2>&1; then \
 	        ok "$$tool found: $$(command -v $$tool)"; \
+	    elif [ "$$tool" = "cosign" ]; then \
+	        warn "cosign not found — install it before signing model or application images"; \
 	    else \
 	        fail "$$tool not found — install it before continuing"; \
 	    fi; \
@@ -281,16 +283,16 @@ check-prereqs:
 	echo ""; \
 	echo "=== CPU TEE capability ==="; \
 	NODE_NAME=$$(oc get nodes -o jsonpath='{.items[0].metadata.name}'); \
-	echo "  Checking dmesg on $$NODE_NAME (spawns a debug pod — takes ~30s)..."; \
-	oc debug node/$$NODE_NAME -- chroot /host dmesg 2>/dev/null \
-	    | grep -iE 'tdx|sev.snp|sme' > /tmp/tee-dmesg-check.txt 2>/dev/null || true; \
-	if grep -qi "tdx" /tmp/tee-dmesg-check.txt; then \
-	    if grep -q "BIOS enabled" /tmp/tee-dmesg-check.txt; then \
-	        ok "Intel TDX: BIOS enabled — $$(grep 'BIOS enabled' /tmp/tee-dmesg-check.txt | tail -1 | sed 's/.*tdx: //')"; \
+	echo "  Checking kernel journal on $$NODE_NAME (spawns a debug pod — takes ~30s)..."; \
+	oc debug node/$$NODE_NAME -- chroot /host journalctl -k 2>/dev/null \
+	    | grep -iE 'tdx|sev.snp|sme' > /tmp/tee-kernel-log-check.txt 2>/dev/null || true; \
+	if grep -qi "tdx" /tmp/tee-kernel-log-check.txt; then \
+	    if grep -q "BIOS enabled" /tmp/tee-kernel-log-check.txt; then \
+	        ok "Intel TDX: BIOS enabled — $$(grep 'BIOS enabled' /tmp/tee-kernel-log-check.txt | tail -1 | sed 's/.*tdx: //')"; \
 	    fi; \
-	    if grep -q "initialization failed: Hibernation" /tmp/tee-dmesg-check.txt; then \
+	    if grep -q "initialization failed: Hibernation" /tmp/tee-kernel-log-check.txt; then \
 	        fail "Intel TDX: kernel init blocked by hibernation — run: make setup-intel-tee (adds nohibernate kernel arg)"; \
-	    elif grep -qi "tdx.*initialized\|initialized.*tdx\|module initialized" /tmp/tee-dmesg-check.txt; then \
+	    elif grep -qi "tdx.*initialized\|initialized.*tdx\|module initialized" /tmp/tee-kernel-log-check.txt; then \
 	        ok "Intel TDX: kernel initialized — TDX active"; \
 	        if oc get node "$$NODE_NAME" -o jsonpath='{.metadata.labels}' 2>/dev/null \
 	                | grep -q 'intel\.feature\.node\.kubernetes\.io/tdx'; then \
@@ -299,9 +301,9 @@ check-prereqs:
 	            warn "Intel TDX: active in kernel but NFD label not yet set — run: make setup-intel-tee"; \
 	        fi; \
 	    else \
-	        warn "Intel TDX: BIOS enabled but kernel status unclear — check: oc debug node/$$NODE_NAME -- chroot /host dmesg | grep -i tdx"; \
+	        warn "Intel TDX: BIOS enabled but kernel status unclear — check: oc debug node/$$NODE_NAME -- chroot /host journalctl -k | grep -i tdx"; \
 	    fi; \
-	elif grep -qi "sev.snp.*enabled\|snp.*active" /tmp/tee-dmesg-check.txt; then \
+	elif grep -qi "sev.snp.*enabled\|snp.*active" /tmp/tee-kernel-log-check.txt; then \
 	    ok "AMD SEV-SNP: enabled in kernel"; \
 	    if oc get node "$$NODE_NAME" -o jsonpath='{.metadata.labels}' 2>/dev/null \
 	            | grep -q 'amd\.feature\.node\.kubernetes\.io/snp'; then \
@@ -310,9 +312,9 @@ check-prereqs:
 	        warn "AMD SEV-SNP: active in kernel but NFD label not yet set — run: make setup-amd-tee"; \
 	    fi; \
 	else \
-	    fail "No TDX or SEV-SNP found in dmesg — enable TEE in server BIOS (see README hardware prerequisites)"; \
+	    fail "No TDX or SEV-SNP found in kernel journal — enable TEE in server BIOS (see README hardware prerequisites)"; \
 	fi; \
-	rm -f /tmp/tee-dmesg-check.txt; \
+	rm -f /tmp/tee-kernel-log-check.txt; \
 	\
 	echo ""; \
 	echo "=== Required operators ==="; \
@@ -333,7 +335,7 @@ check-prereqs:
 	if oc get csv -n openshift-nfd 2>/dev/null | grep -q "nfd.*Succeeded"; then \
 	    ok "Node Feature Discovery: installed"; \
 	else \
-	    warn "Node Feature Discovery not installed — run make setup-intel-tee or make setup-amd-tee"; \
+	    warn "Node Feature Discovery not installed — run make setup-kata"; \
 	fi; \
 	\
 	if oc get csv -n openshift-sandboxed-containers-operator 2>/dev/null \
@@ -733,7 +735,7 @@ setup-intel-tee:
 	fi; \
 	echo "Verifying TDX is active in kernel (spawning debug pod — ~30s)..."; \
 	NODE_NAME=$$(oc get nodes -o jsonpath='{.items[0].metadata.name}'); \
-	oc debug node/$$NODE_NAME -- chroot /host dmesg 2>/dev/null \
+	oc debug node/$$NODE_NAME -- chroot /host journalctl -k 2>/dev/null \
 	    | grep -i tdx > /tmp/tdx-verify.txt || true; \
 	if grep -q "BIOS enabled" /tmp/tdx-verify.txt && \
 	        ! grep -q "initialization failed" /tmp/tdx-verify.txt; then \
@@ -785,14 +787,14 @@ setup-amd-tee:
 	fi; \
 	echo "Verifying SEV-SNP is active in kernel (spawning debug pod — ~30s)..."; \
 	NODE_NAME=$$(oc get nodes -o jsonpath='{.items[0].metadata.name}'); \
-	oc debug node/$$NODE_NAME -- chroot /host dmesg 2>/dev/null \
+	oc debug node/$$NODE_NAME -- chroot /host journalctl -k 2>/dev/null \
 	    | grep -iE "sev.snp|sev snp" > /tmp/snp-verify.txt || true; \
 	if grep -qi "snp" /tmp/snp-verify.txt; then \
 	    echo "SEV-SNP active: $$(grep -i snp /tmp/snp-verify.txt | tail -1 | sed 's/.*\] //')"; \
 	    rm -f /tmp/snp-verify.txt; \
 	    echo "=== setup-amd-tee complete — run make setup-kata next ==="; \
 	else \
-	    echo "ERROR: SEV-SNP not detected in kernel dmesg."; \
+	    echo "ERROR: SEV-SNP not detected in kernel journal."; \
 	    echo "       Verify BIOS settings — SEV-SNP must be enabled in server firmware (see README)."; \
 	    rm -f /tmp/snp-verify.txt; \
 	    exit 1; \
