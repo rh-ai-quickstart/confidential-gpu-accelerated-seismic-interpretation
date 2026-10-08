@@ -1,4 +1,4 @@
-# A Deploy Confidential GPU-Accelerated Seismic Interpretation
+# Deploy Confidential GPU-Accelerated Seismic Interpretation
 
 AI-powered classification from North Sea seismic data — run this quickstart within a confidential container on Red Hat® OpenShift® AI.
 
