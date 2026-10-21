@@ -3,11 +3,13 @@
 Build the cc_init_data blob for the kata VM.
 
 Usage: build-initdata.py <KBS_URL> <NAMESPACE> [--mr-config-id]
+                         [--init-data-hash]
                          [--policy-mode dev|locked]
                          [--app-image <repo>] [--model-image <repo>]
   Reads the KBS TLS certificate PEM from stdin.
   Default: prints the gzip+base64-encoded initdata TOML to stdout.
   --mr-config-id: prints the TDX mr_config_id hex value to stdout instead.
+  --init-data-hash: prints the SHA-256 digest used as AMD SNP HOST_DATA.
   --policy-mode: selects scripts/policy-dev.rego or scripts/policy-locked.rego
                  (default: locked)
   --app-image / --model-image: image repo prefixes substituted into the locked
@@ -35,7 +37,9 @@ import sys
 parser = argparse.ArgumentParser()
 parser.add_argument("kbs_url")
 parser.add_argument("namespace")
-parser.add_argument("--mr-config-id", action="store_true")
+hash_group = parser.add_mutually_exclusive_group()
+hash_group.add_argument("--mr-config-id", action="store_true")
+hash_group.add_argument("--init-data-hash", action="store_true")
 parser.add_argument("--policy-mode", default="locked", choices=["dev", "locked"])
 parser.add_argument("--app-image", default="")
 parser.add_argument("--model-image", default="")
@@ -110,8 +114,10 @@ version = "0.1.0"
 
 toml_bytes = toml.encode()
 
-if mr_config_id_only:
-    toml_hash = hashlib.sha256(toml_bytes).digest()   # 32 bytes
+toml_hash = hashlib.sha256(toml_bytes).digest()
+if parsed.init_data_hash:
+    print(toml_hash.hex(), end="")
+elif mr_config_id_only:
     mr_config_id = (toml_hash + bytes(16)).hex()       # zero-pad to 48 bytes = 96 hex chars
     print(mr_config_id, end="")
 else:

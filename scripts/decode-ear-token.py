@@ -204,7 +204,7 @@ def print_evidence_section(name, data, expected):
     tdx_keys = [k for k in ev if k != 'nvidia']
 
     if tdx_keys:
-        print("    TDX / CPU Evidence:")
+        print("    CPU / TEE Evidence:")
         for key in sorted(tdx_keys):
             val = ev[key]
             exp = expected.get(key, '')

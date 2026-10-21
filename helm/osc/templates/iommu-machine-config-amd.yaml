@@ -1,0 +1,17 @@
+# Enables the AMD IOMMU — required for AMD SEV-SNP.
+# Does NOT set iommu=pt: AMD's amd_iommu driver disables SNP support when
+# the IOMMU is in passthrough mode, since SNP requires per-device IOMMU
+# page tables to enforce RMP checks on DMA. Passthrough mode is used for
+# GPU passthrough on the Intel path (see iommu-machine-config.yaml) but
+# is incompatible with SEV-SNP on AMD.
+# Default role: master (single-node / SNO). For multi-node clusters where
+# kata workloads run on worker nodes, change the role label to "worker".
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 101-iommu-kernel-args-amd
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  kernelArguments:
+    - amd_iommu=on

@@ -116,6 +116,7 @@ for section_name, content in [("aa.toml", aa_toml), ("cdh.toml", cdh_toml), ("po
 
 print(rule())
 print(f"  TOML SHA-256 : {toml_hash}")
+print(f"  SNP init_data: {toml_hash}")
 print(f"  mr_config_id : {mr_config_id}")
 print(f"  Encoded size : {encoded_kb:.1f} KB  ({len(encoded)} chars base64)")
 print(rule())

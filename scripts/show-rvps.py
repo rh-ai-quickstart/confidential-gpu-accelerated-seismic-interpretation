@@ -3,12 +3,13 @@
 Decode and pretty-print RVPS reference values — both what 'make set-rvps-values'
 would register and what is currently stored in the trustee ConfigMap.
 
-Shows all known TDX attestation fields with a clear indicator of whether each
-will be registered or not, and why.
+Shows the relevant TEE attestation fields with a clear indicator of whether
+each will be registered or not, and why.
 
-Usage: show-rvps.py <mr_config_id_value> [<current_configmap_json>]
+Usage: show-rvps.py <mr_config_id_value> [<current_configmap_json>] [--amd]
   mr_config_id_value     - hex mr_config_id computed from current initdata (pass '-' to skip)
   current_configmap_json - JSON from the reference_value configmap key (optional)
+  --amd                  - show AMD SEV-SNP reference values instead of TDX values
 
 TDX hardware measurements are read from environment variables:
   TDX_MR_TD         TDVF guest firmware measurement
@@ -19,7 +20,16 @@ TDX hardware measurements are read from environment variables:
   TDX_RTMR_3        post-boot guest measurements
   TDX_TD_ATTRIBUTES TD attribute flags (debug bit)
   TDX_MR_SEAM       Intel TDX module measurement
+
+AMD SEV-SNP reference values are read from environment variables:
+  SNP_MEASUREMENT  hex-encoded launch measurement
+  SNP_INIT_DATA_HASH SHA-256 initdata digest used as AMD SNP HOST_DATA
+  SNP_BOOTLOADER  reported bootloader SVN
+  SNP_TEE_SVN      reported TEE SVN
+  SNP_SVN          reported SNP SVN
+  SNP_MICROCODE    reported microcode version
 """
+import argparse
 import base64
 import json
 import os
@@ -118,6 +128,64 @@ FIELDS = [
     },
 ]
 
+TDX_FIELD_NAMES = {f["name"] for f in FIELDS}
+SNP_FIELDS = [
+    {
+        "name":    "snp_init_data",
+        "desc":    "AMD SEV-SNP initdata binding",
+        "detail":  "SHA-256 digest of initdata, checked by the CPU policy against RVPS",
+        "env_key": "SNP_INIT_DATA_HASH",
+        "note":    "computed from the current KBS certificate and initdata settings",
+        "changes": "namespace, KBS certificate, KBS URL, policy mode, or app/model image repositories change",
+        "action":  "make set-rvps-values; required for key release when the policy check is enabled",
+    },
+    {
+        "name":    "snp_launch_measurement",
+        "desc":    "AMD SEV-SNP launch measurement",
+        "detail":  "48-byte launch digest in hex, matching Trustee's snp.measurement claim",
+        "env_key": "SNP_MEASUREMENT",
+        "note":    "set SNP_MEASUREMENT from scripts/collect-snp-measurements.sh",
+        "changes": "OSC upgrade that changes the Kata guest firmware or boot image",
+        "action":  "make collect-snp-measurements, then make set-rvps-values",
+    },
+    {
+        "name":    "snp_bootloader",
+        "desc":    "AMD PSP bootloader SVN",
+        "detail":  "reported bootloader TCB version from the SNP attestation report",
+        "env_key": "SNP_BOOTLOADER",
+        "note":    "set SNP_BOOTLOADER from scripts/collect-snp-measurements.sh",
+        "changes": "AMD platform firmware update",
+        "action":  "make collect-snp-measurements, then make set-rvps-values",
+    },
+    {
+        "name":    "snp_tee_svn",
+        "desc":    "AMD PSP TEE SVN",
+        "detail":  "reported TEE security version from the SNP attestation report",
+        "env_key": "SNP_TEE_SVN",
+        "note":    "set SNP_TEE_SVN from scripts/collect-snp-measurements.sh",
+        "changes": "AMD platform firmware update",
+        "action":  "make collect-snp-measurements, then make set-rvps-values",
+    },
+    {
+        "name":    "snp_snp_svn",
+        "desc":    "AMD SNP firmware SVN",
+        "detail":  "reported SNP security version from the SNP attestation report",
+        "env_key": "SNP_SVN",
+        "note":    "set SNP_SVN from scripts/collect-snp-measurements.sh",
+        "changes": "AMD platform firmware update",
+        "action":  "make collect-snp-measurements, then make set-rvps-values",
+    },
+    {
+        "name":    "snp_microcode",
+        "desc":    "AMD CPU microcode version",
+        "detail":  "reported microcode version from the SNP attestation report",
+        "env_key": "SNP_MICROCODE",
+        "note":    "set SNP_MICROCODE from scripts/collect-snp-measurements.sh",
+        "changes": "host BIOS or CPU microcode update",
+        "action":  "make collect-snp-measurements, then make set-rvps-values",
+    },
+]
+
 W = 72
 
 def rule(char="─"):
@@ -143,18 +211,42 @@ def wrap(text, indent, width=W):
         lines.append(indent + cur)
     return "\n".join(lines)
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("mr_config_id_value", nargs="?", default="-")
+parser.add_argument("current_configmap_json", nargs="?", default="{}")
+parser.add_argument(
+    "--amd",
+    action="store_true",
+    help="show AMD SEV-SNP references instead of Intel TDX references",
+)
+args = parser.parse_args()
+
+if args.amd:
+    FIELDS = SNP_FIELDS
+
 # ── Collect computed values ───────────────────────────────────────────────────
 
-mr_config_id = sys.argv[1] if len(sys.argv) > 1 else "-"
-current_json = sys.argv[2] if len(sys.argv) > 2 else "{}"
+mr_config_id = args.mr_config_id_value
+current_json = args.current_configmap_json
 
 computed = {}
-if mr_config_id and mr_config_id != "-":
+if not args.amd and mr_config_id and mr_config_id != "-":
     computed["mr_config_id"] = mr_config_id
 for f in FIELDS:
     if f["env_key"]:
         val = os.environ.get(f["env_key"], "").strip()
         if val:
+            if args.amd and f["name"] in {
+                "snp_bootloader", "snp_tee_svn", "snp_snp_svn", "snp_microcode"
+            }:
+                try:
+                    val = int(val, 10)
+                except ValueError:
+                    print(
+                        f"ERROR: {f['env_key']} must be a decimal integer, got {val!r}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
             computed[f["name"]] = val
 
 # ── Decode current configmap ──────────────────────────────────────────────────
@@ -164,6 +256,8 @@ if current_json and current_json.strip() not in ("", "{}"):
     try:
         raw = json.loads(current_json)
         for name, b64 in raw.items():
+            if args.amd and name in TDX_FIELD_NAMES:
+                continue
             try:
                 current[name] = decode_entry(b64)
             except Exception:
@@ -191,7 +285,7 @@ for f in FIELDS:
     name  = f["name"]
     value = computed.get(name)
 
-    if value:
+    if value is not None:
         print(f"  ✓  {name:<14}  {f['desc']}")
     else:
         print(f"  ✗  {name:<14}  {f['desc']}")
@@ -200,7 +294,7 @@ for f in FIELDS:
     print(wrap(f"changes: {f['changes']}", IND))
     print(wrap(f"action:  {f['action']}",  IND))
 
-    if value:
+    if value is not None:
         print(f"{IND}{value}")
     else:
         if f["note"]:

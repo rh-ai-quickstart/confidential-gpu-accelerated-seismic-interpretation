@@ -43,6 +43,13 @@ TDX_RTMR_0       ?= 01cbbe9a7adb5f1f9459085d6f9f4bd02a5bf5352a8287b4ba963b35bc3f
 TDX_RTMR_1       ?= 93a576941cfe92d6427106944e475e96b702d1049975b6c64512345857d69dbab8d14c5f3dc88931cc582c9974fae8cc
 TDX_RTMR_2       ?= e882c8d18de74cc30d506d56962e5d3eb33c98e6c25f0329857c29f03a48fb17b6c6b1e2acc4741b305a6656a5f7d6c9
 TDX_RTMR_3       ?= 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+# AMD SEV-SNP RVPS reference values, collected from a probe pod.
+# SEV-SNP measurement (hex format used by Trustee's snp.measurement claim; OSC 1.20.1)
+SNP_MEASUREMENT  ?= 95eff3fcb7a26e5e91e6de1059dec9c17cfed8c5b5ea855d7fe019b694224b0033dcd471a1dc75973cdee9379ec0b83d
+SNP_BOOTLOADER   ?= 7
+SNP_TEE_SVN      ?= 0
+SNP_SVN          ?= 23
+SNP_MICROCODE    ?= 62
 
 # Space-separated list of node names to label nvidia.com/gpu.workload.config=vm-passthrough.
 # Nodes in this list stop advertising nvidia.com/gpu and instead advertise nvidia.com/pgpu.
@@ -143,13 +150,15 @@ help:
 	@echo "                               measurements (mr_td, xfam, rtmr_0-3, td_attributes, mr_seam)"
 	@echo "                               Paste the printed Makefile variables here; re-run after OSC upgrades"
 	@echo "                               (requires NAMESPACE; uses KATA_RUNTIME_CLASS)"
-	@echo "    set-rvps-values          - Compute and register mr_config_id and TDX hardware measurements in RVPS;"
+	@echo "    collect-snp-measurements - Launch a kata GPU probe on AMD SEV-SNP and collect CPU/GPU evidence"
+	@echo "                               (requires NAMESPACE; uses KATA_RUNTIME_CLASS)"
+	@echo "    set-rvps-values          - Register the initdata binding plus TDX or AMD SEV-SNP references in RVPS;"
 	@echo "                               restarts Trustee to pick up the updated configmap"
-	@echo "                               (requires NAMESPACE; export TDX_MR_TD/XFAM/RTMR_* for full attestation)"
+	@echo "                               (requires NAMESPACE; TDX_* or SNP_* values from the matching collector)"
 	@echo "    register-secrets-with-kbs - Register model key, cosign key, and image policy with KBS"
 	@echo "                               via kbsSecretResources (requires NAMESPACE, MODEL_ENCRYPTION_KEY,"
 	@echo "                               model-owner-verification-keys/cosign.pub)"
-	@echo "    patch-cpu-policy-initdata       - Add initdata binding to the CPU attestation policy (mr_config_id check); restarts Trustee"
+	@echo "    patch-cpu-policy-initdata       - Bind TDX or AMD policy to the expected initdata; restarts Trustee"
 	@echo "    patch-cpu-policy-firmwarelevel         - Apply the quickstart CPU attestation policy (date-based TCB check instead"
 	@echo "                               of requiring UpToDate TCB status); restarts Trustee"
 	@echo "    setup-attestation        - Convenience target: runs set-rvps-values then register-secrets-with-kbs"
@@ -157,11 +166,11 @@ help:
 	@echo "                               KBS is currently serving; fails if cert-manager has rotated the cert"
 	@echo "                               since the last 'make install' (which would break TLS in the kata VM)"
 	@echo "    show-initdata            - Print the decoded initdata that would be embedded in the pod:"
-	@echo "                               aa.toml, cdh.toml, policy.rego, SHA-256, and mr_config_id"
+	@echo "                               aa.toml, cdh.toml, policy.rego, initdata SHA-256/HOST_DATA, and mr_config_id"
 	@echo "                               (requires NAMESPACE; uses POLICY_MODE, APP_IMG, MODEL_IMG)"
 	@echo "    show-rvps                - Print RVPS reference values: what would be registered by"
 	@echo "                               set-rvps-values vs what is currently in the ConfigMap"
-	@echo "                               (requires NAMESPACE; export TDX_MR_TD/XFAM/RTMR_1/RTMR_2)"
+	@echo "                               (requires NAMESPACE; TDX_* or SNP_* values from the matching collector)"
 	@echo "    clear-rvps               - Remove all registered RVPS reference values and restart Trustee"
 	@echo "                               WARNING: attestation will fail for all pods until re-registered"
 	@echo "    trustee-logs             - Show the last 100 log lines from the Trustee deployment"
@@ -203,7 +212,12 @@ help:
 	@echo "  TDX_RTMR_2             -   Optional: TDX_RTMR_3 TDX_TD_ATTRIBUTES TDX_MR_SEAM"
 	@echo "  TDX_RTMR_3             -   Without the required set, attestation fails after 'make install'."
 	@echo "  TDX_TD_ATTRIBUTES      -"
-	@echo "  TDX_MR_SEAM            -"
+	@echo "  TDX_MR_SEAM            - Intel TDX module measurement (TDX only)."
+	@echo "  SNP_MEASUREMENT        - Hex launch measurement from collect-snp-measurements."
+	@echo "  SNP_BOOTLOADER         - AMD reported bootloader SVN from the SNP report."
+	@echo "  SNP_TEE_SVN            - AMD reported TEE SVN from the SNP report."
+	@echo "  SNP_SVN                - AMD reported SNP SVN from the SNP report."
+	@echo "  SNP_MICROCODE          - AMD reported microcode from the SNP report."
 	@echo "  GPU_PASSTHROUGH_NODES  - Space-separated node names to label for kata VM passthrough during setup-kata."
 	@echo "                           Labeled nodes stop advertising nvidia.com/gpu and advertise nvidia.com/pgpu instead."
 	@echo "                           Unlabeled GPU nodes continue serving standard CUDA workloads unchanged."
@@ -231,15 +245,18 @@ check-prereqs:
 	\
 	echo ""; \
 	echo "=== Local tools ==="; \
-	for tool in oc helm cosign openssl curl base64 python3; do \
+	for tool in oc helm openssl curl base64 python3; do \
 	    if command -v $$tool >/dev/null 2>&1; then \
 	        ok "$$tool found: $$(command -v $$tool)"; \
-	    elif [ "$$tool" = "cosign" ]; then \
-	        warn "cosign not found — install it before signing model or application images"; \
 	    else \
 	        fail "$$tool not found — install it before continuing"; \
 	    fi; \
 	done; \
+	if command -v cosign >/dev/null 2>&1; then \
+	    ok "cosign found: $$(command -v cosign)"; \
+	else \
+	    warn "cosign not found — install it if you want to build your own images"; \
+	fi; \
 	\
 	echo ""; \
 	echo "=== OpenShift cluster ==="; \
@@ -284,8 +301,12 @@ check-prereqs:
 	echo "=== CPU TEE capability ==="; \
 	NODE_NAME=$$(oc get nodes -o jsonpath='{.items[0].metadata.name}'); \
 	echo "  Checking kernel journal on $$NODE_NAME (spawns a debug pod — takes ~30s)..."; \
-	oc debug node/$$NODE_NAME -- chroot /host journalctl -k 2>/dev/null \
-	    | grep -iE 'tdx|sev.snp|sme' > /tmp/tee-kernel-log-check.txt 2>/dev/null || true; \
+	oc debug node/$$NODE_NAME -- chroot /host sh -c 'journalctl -k 2>/dev/null | grep -iE "tdx|sev[-. ]snp|sme"; grep -m1 vendor_id /proc/cpuinfo; printf "KVM_AMD_SEV_SNP="; cat /sys/module/kvm_amd/parameters/sev_snp 2>/dev/null || echo unavailable; grep -m1 -o sev_snp /proc/cpuinfo || true' \
+	    > /tmp/tee-kernel-log-check.txt 2>/dev/null || true; \
+	CPU_VENDOR="unknown"; \
+	if grep -qi "GenuineIntel" /tmp/tee-kernel-log-check.txt; then CPU_VENDOR="intel"; \
+	elif grep -qi "AuthenticAMD" /tmp/tee-kernel-log-check.txt; then CPU_VENDOR="amd"; fi; \
+	SNP_PARAM=$$(sed -n 's/^KVM_AMD_SEV_SNP=//p' /tmp/tee-kernel-log-check.txt); \
 	if grep -qi "tdx" /tmp/tee-kernel-log-check.txt; then \
 	    if grep -q "BIOS enabled" /tmp/tee-kernel-log-check.txt; then \
 	        ok "Intel TDX: BIOS enabled — $$(grep 'BIOS enabled' /tmp/tee-kernel-log-check.txt | tail -1 | sed 's/.*tdx: //')"; \
@@ -297,20 +318,21 @@ check-prereqs:
 	        if oc get node "$$NODE_NAME" -o jsonpath='{.metadata.labels}' 2>/dev/null \
 	                | grep -q 'intel\.feature\.node\.kubernetes\.io/tdx'; then \
 	            ok "Intel TDX: NFD label intel.feature.node.kubernetes.io/tdx confirmed"; \
-	        else \
-	            warn "Intel TDX: active in kernel but NFD label not yet set — run: make setup-intel-tee"; \
 	        fi; \
 	    else \
 	        warn "Intel TDX: BIOS enabled but kernel status unclear — check: oc debug node/$$NODE_NAME -- chroot /host journalctl -k | grep -i tdx"; \
 	    fi; \
-	elif grep -qi "sev.snp.*enabled\|snp.*active" /tmp/tee-kernel-log-check.txt; then \
-	    ok "AMD SEV-SNP: enabled in kernel"; \
+	elif [ "$$CPU_VENDOR" = "amd" ] && grep -qiE '^KVM_AMD_SEV_SNP=(Y|1)$$' /tmp/tee-kernel-log-check.txt; then \
+	    ok "AMD SEV-SNP: enabled in kvm_amd module"; \
+	    if grep -q '^sev_snp$$' /tmp/tee-kernel-log-check.txt; then \
+	        ok "AMD SEV-SNP: CPU capability confirmed"; \
+	    fi; \
 	    if oc get node "$$NODE_NAME" -o jsonpath='{.metadata.labels}' 2>/dev/null \
 	            | grep -q 'amd\.feature\.node\.kubernetes\.io/snp'; then \
 	        ok "AMD SEV-SNP: NFD label amd.feature.node.kubernetes.io/snp confirmed"; \
-	    else \
-	        warn "AMD SEV-SNP: active in kernel but NFD label not yet set — run: make setup-amd-tee"; \
 	    fi; \
+	elif [ "$$CPU_VENDOR" = "amd" ]; then \
+	    fail "AMD SEV-SNP is not active in kvm_amd (sev_snp=$$SNP_PARAM; expected Y) — enable SEV-SNP in BIOS and check the kernel module"; \
 	else \
 	    fail "No TDX or SEV-SNP found in kernel journal — enable TEE in server BIOS (see README hardware prerequisites)"; \
 	fi; \
@@ -341,54 +363,58 @@ check-prereqs:
 	if oc get csv -n openshift-sandboxed-containers-operator 2>/dev/null \
 	        | grep -q "sandboxed-containers.*Succeeded"; then \
 	    ok "OpenShift Sandboxed Containers: installed"; \
-	else \
-	    warn "OpenShift Sandboxed Containers not installed — run make setup-trustee-in-cluster"; \
 	fi; \
 	\
 	if oc get csv -n trustee-operator-system 2>/dev/null | grep -q "trustee-operator.*Succeeded"; then \
 	    ok "Trustee operator: installed"; \
-	else \
-	    warn "Trustee operator not installed — run make setup-trustee-in-cluster"; \
 	fi; \
 	\
 	echo ""; \
 	echo "=== TEE kernel parameters (MachineConfigs) ==="; \
-	if oc get mc 99-enable-intel-tdx --ignore-not-found 2>/dev/null | grep -q .; then \
+	if [ "$$CPU_VENDOR" = "amd" ]; then \
+	    ok "MachineConfig 99-enable-intel-tdx not applicable (AMD CPU)"; \
+	elif oc get mc 99-enable-intel-tdx --ignore-not-found 2>/dev/null | grep -q .; then \
 	    ok "MachineConfig 99-enable-intel-tdx present (kvm_intel.tdx=1 + vsock-loopback)"; \
 	else \
 	    warn "MachineConfig 99-enable-intel-tdx not found — run: make setup-intel-tee"; \
 	fi; \
 	if oc get mc 100-iommu-kernel-args --ignore-not-found 2>/dev/null | grep -q .; then \
 	    ok "MachineConfig 100-iommu-kernel-args present (intel_iommu/amd_iommu=on iommu=pt)"; \
+	elif oc get mc 101-iommu-kernel-args-amd --ignore-not-found 2>/dev/null | grep -q .; then \
+	    ok "MachineConfig 101-iommu-kernel-args-amd present (amd_iommu=on)"; \
 	else \
-	    warn "MachineConfig 100-iommu-kernel-args not found — run: make setup-intel-tee or setup-amd-tee"; \
+	    warn "IOMMU MachineConfig not found — run: make setup-intel-tee or setup-amd-tee"; \
 	fi; \
 	\
 	echo ""; \
-	echo "=== Intel DCAP (TDX quote generation) ==="; \
-	if oc get csv -n intel-dcap 2>/dev/null \
-	        | grep -q "intel-device-plugins-operator.*Succeeded"; then \
-	    ok "Intel Device Plugin Operator: installed"; \
+	if [ "$$CPU_VENDOR" = "amd" ]; then \
+	    echo "=== Intel DCAP (TDX quote generation) — skipped (AMD CPU) ==="; \
 	else \
-	    warn "Intel Device Plugin Operator not found — run: make setup-dcap INTEL_API_KEY=<key> (Intel TDX only)"; \
-	fi; \
-	if oc get csv -n intel-dcap 2>/dev/null \
-	        | grep -q "intel-tdx-dcap-operator.*Succeeded"; then \
-	    ok "Intel TDX DCAP Operator: installed"; \
-	else \
-	    warn "Intel TDX DCAP Operator not found — run: make setup-dcap INTEL_API_KEY=<key> (Intel TDX only)"; \
-	fi; \
-	if oc get tdxquotegenerationservices.trustedservices.intel.com intel-tdx-dcap -n intel-dcap \
-	        --ignore-not-found 2>/dev/null | grep -q .; then \
-	    QGS_RUNNING=$$(oc get pods -n intel-dcap 2>/dev/null \
-	        | grep "intel-tdx-dcap-qgs" | grep -c "Running" || echo "0"); \
-	    if [ "$$QGS_RUNNING" -gt 0 ]; then \
-	        ok "TdxQuoteGenerationService: $$QGS_RUNNING QGS pod(s) running"; \
+	    echo "=== Intel DCAP (TDX quote generation) ==="; \
+	    if oc get csv -n intel-dcap 2>/dev/null \
+	            | grep -q "intel-device-plugins-operator.*Succeeded"; then \
+	        ok "Intel Device Plugin Operator: installed"; \
 	    else \
-	        warn "TdxQuoteGenerationService CR exists but no QGS pods running — check: oc get pods -n intel-dcap"; \
+	        warn "Intel Device Plugin Operator not found — run: make setup-dcap INTEL_API_KEY=<key> (Intel TDX only)"; \
 	    fi; \
-	else \
-	    warn "TdxQuoteGenerationService not found — run: make setup-dcap INTEL_API_KEY=<key> (Intel TDX only)"; \
+	    if oc get csv -n intel-dcap 2>/dev/null \
+	            | grep -q "intel-tdx-dcap-operator.*Succeeded"; then \
+	        ok "Intel TDX DCAP Operator: installed"; \
+	    else \
+	        warn "Intel TDX DCAP Operator not found — run: make setup-dcap INTEL_API_KEY=<key> (Intel TDX only)"; \
+	    fi; \
+	    if oc get tdxquotegenerationservices.trustedservices.intel.com intel-tdx-dcap -n intel-dcap \
+	            --ignore-not-found 2>/dev/null | grep -q .; then \
+	        QGS_RUNNING=$$(oc get pods -n intel-dcap 2>/dev/null \
+	            | grep "intel-tdx-dcap-qgs" | grep -c "Running" || echo "0"); \
+	        if [ "$$QGS_RUNNING" -gt 0 ]; then \
+	            ok "TdxQuoteGenerationService: $$QGS_RUNNING QGS pod(s) running"; \
+	        else \
+	            warn "TdxQuoteGenerationService CR exists but no QGS pods running — check: oc get pods -n intel-dcap"; \
+	        fi; \
+	    else \
+	        warn "TdxQuoteGenerationService not found — run: make setup-dcap INTEL_API_KEY=<key> (Intel TDX only)"; \
+	    fi; \
 	fi; \
 	\
 	echo ""; \
@@ -763,12 +789,12 @@ setup-amd-tee:
 	if [ "$$PURE_WORKERS" != "0" ]; then \
 	    echo "WARNING: Multi-node cluster detected."; \
 	    echo "         IOMMU MachineConfig targets master role by default — for worker nodes running kata,"; \
-	    echo "         edit helm/osc/templates/iommu-machine-config.yaml to set role: worker, then apply manually."; \
+	    echo "         edit helm/osc/templates/iommu-machine-config-amd.yaml to set role: worker, then apply manually."; \
 	else \
-	    if oc get mc 100-iommu-kernel-args --ignore-not-found 2>/dev/null | grep -q .; then \
+	    if oc get mc 101-iommu-kernel-args-amd --ignore-not-found 2>/dev/null | grep -q .; then \
 	        echo "WARNING: IOMMU MachineConfig already exists, skipping."; \
 	    else \
-	        oc apply -f helm/osc/templates/iommu-machine-config.yaml; \
+	        oc apply -f helm/osc/templates/iommu-machine-config-amd.yaml; \
 	        echo "WARNING: Node will now reboot to apply IOMMU parameters (~10 min)."; \
 	        echo "         API server will be briefly unreachable during the reboot."; \
 	        sleep 30; \
@@ -812,7 +838,8 @@ setup-kata:
 	    exit 1; \
 	fi; \
 	echo "GPU Operator: OK"; \
-	if ! oc get mc 100-iommu-kernel-args --ignore-not-found 2>/dev/null | grep -q .; then \
+	if ! oc get mc 100-iommu-kernel-args --ignore-not-found 2>/dev/null | grep -q . \
+	        && ! oc get mc 101-iommu-kernel-args-amd --ignore-not-found 2>/dev/null | grep -q .; then \
 	    echo "ERROR: IOMMU MachineConfig not found."; \
 	    echo "       Run make setup-intel-tee (Intel) or make setup-amd-tee (AMD) first."; \
 	    exit 1; \
@@ -1536,42 +1563,75 @@ collect-tdx-measurements:
 	@[ -n "$$NAMESPACE" ] || (echo "Error: NAMESPACE is not set"; exit 1)
 	bash scripts/collect-tdx-measurements.sh "$(NAMESPACE)" "$(KATA_RUNTIME_CLASS)"
 
+.PHONY: collect-snp-measurements
+collect-snp-measurements:
+	@[ -n "$$NAMESPACE" ] || (echo "Error: NAMESPACE is not set"; exit 1)
+	bash scripts/collect-snp-measurements.sh "$(NAMESPACE)" "$(KATA_RUNTIME_CLASS)"
+
 .PHONY: set-rvps-values
 set-rvps-values:
 	@[ -n "$$NAMESPACE" ] || (echo "Error: NAMESPACE is not set"; exit 1)
-	@if [ -z "$(TDX_MR_TD)" ]; then \
-	    echo "WARNING: TDX hardware measurements are not set."; \
-	    echo "         Only mr_config_id will be registered — attestation will fail until"; \
-	    echo "         you run scripts/collect-tdx-measurements.sh, export the printed"; \
-	    echo "         values, and re-run 'make set-rvps-values'."; \
-	    echo "         Required: TDX_MR_TD TDX_XFAM TDX_RTMR_0 TDX_RTMR_1 TDX_RTMR_2"; \
-	    echo "         Optional: TDX_RTMR_3 TDX_TD_ATTRIBUTES TDX_MR_SEAM"; \
-	fi
-	@echo "Computing mr_config_id (initdata configuration binding) for namespace $(NAMESPACE)..."
 	@set -e; \
+	AMD_SNP_NODE=$$(oc get nodes -l amd.feature.node.kubernetes.io/snp=true \
+	    -o name 2>/dev/null | head -n1); \
+	RVPS_MODE_ARGS=; \
+	if [ -n "$$AMD_SNP_NODE" ]; then \
+	    RVPS_MODE_ARGS=--amd; \
+	    if [ -z "$(SNP_MEASUREMENT)" ] || [ -z "$(SNP_BOOTLOADER)" ] || \
+	       [ -z "$(SNP_TEE_SVN)" ] || [ -z "$(SNP_SVN)" ] || \
+	       [ -z "$(SNP_MICROCODE)" ]; then \
+	        echo "ERROR: SNP_MEASUREMENT, SNP_BOOTLOADER, SNP_TEE_SVN, SNP_SVN, and SNP_MICROCODE are required for AMD SEV-SNP." >&2; \
+	        echo "       Run make collect-snp-measurements NAMESPACE=$(NAMESPACE), then pass the printed values to make set-rvps-values." >&2; \
+	        exit 1; \
+	    fi; \
+	    echo "Registering AMD SEV-SNP reference values."; \
+	else \
+	    if [ -z "$(TDX_MR_TD)" ]; then \
+	        echo "WARNING: TDX hardware measurements are not set."; \
+	        echo "         Only the initdata binding and supplied TDX values will be registered."; \
+	        echo "         Collect measurements with scripts/collect-tdx-measurements.sh and re-run this target."; \
+	    fi; \
+	fi; \
 	KBS_CERT=$$(oc get secret trusteeconfig-https-cert-secret -n trustee-operator-system \
 	    -o jsonpath='{.data.certificate}' | base64 -d); \
-	MR_CONFIG_ID=$$(echo "$$KBS_CERT" | python3 scripts/build-initdata.py "https://kbs-service.trustee-operator-system.svc.cluster.local:8080" "$(NAMESPACE)" --mr-config-id \
-	    --policy-mode $(POLICY_MODE) \
-	    --app-image $(APP_IMG) \
-	    --model-image $(MODEL_IMG)); \
-	echo "mr_config_id: $$MR_CONFIG_ID"; \
-	[ -n "$(TDX_MR_SEAM)" ]       && echo "mr_seam:       $(TDX_MR_SEAM)"       || true; \
-	[ -n "$(TDX_TD_ATTRIBUTES)" ] && echo "td_attributes: $(TDX_TD_ATTRIBUTES)" || true; \
-	[ -n "$(TDX_MR_TD)" ]         && echo "mr_td:         $(TDX_MR_TD)"         || true; \
-	[ -n "$(TDX_XFAM)" ]          && echo "xfam:          $(TDX_XFAM)"          || true; \
-	[ -n "$(TDX_RTMR_0)" ]        && echo "rtmr_0:        $(TDX_RTMR_0)"        || true; \
-	[ -n "$(TDX_RTMR_1)" ]        && echo "rtmr_1:        $(TDX_RTMR_1)"        || true; \
-	[ -n "$(TDX_RTMR_2)" ]        && echo "rtmr_2:        $(TDX_RTMR_2)"        || true; \
-	[ -n "$(TDX_RTMR_3)" ]        && echo "rtmr_3:        $(TDX_RTMR_3)"        || true; \
+	BINDING_VALUE=-; \
+	if [ "$$RVPS_MODE_ARGS" = --amd ]; then \
+	    echo "Computing AMD SNP initdata HOST_DATA digest for namespace $(NAMESPACE)..."; \
+	    SNP_INIT_DATA_HASH=$$(echo "$$KBS_CERT" | python3 scripts/build-initdata.py \
+	        "https://kbs-service.trustee-operator-system.svc.cluster.local:8080" "$(NAMESPACE)" \
+	        --init-data-hash --policy-mode $(POLICY_MODE) \
+	        --app-image $(APP_IMG) --model-image $(MODEL_IMG)); \
+	    echo "snp_init_data:       $$SNP_INIT_DATA_HASH"; \
+	    echo "snp_launch_measurement: $(SNP_MEASUREMENT)"; \
+	    echo "snp_bootloader:        $(SNP_BOOTLOADER)"; \
+	    echo "snp_tee_svn:           $(SNP_TEE_SVN)"; \
+	    echo "snp_snp_svn:           $(SNP_SVN)"; \
+	    echo "snp_microcode:         $(SNP_MICROCODE)"; \
+	else \
+	    echo "Computing mr_config_id (initdata configuration binding) for namespace $(NAMESPACE)..."; \
+	    BINDING_VALUE=$$(echo "$$KBS_CERT" | python3 scripts/build-initdata.py \
+	        "https://kbs-service.trustee-operator-system.svc.cluster.local:8080" "$(NAMESPACE)" --mr-config-id \
+	        --policy-mode $(POLICY_MODE) --app-image $(APP_IMG) --model-image $(MODEL_IMG)); \
+	    echo "mr_config_id: $$BINDING_VALUE"; \
+	    [ -n "$(TDX_MR_SEAM)" ]       && echo "mr_seam:       $(TDX_MR_SEAM)"       || true; \
+	    [ -n "$(TDX_TD_ATTRIBUTES)" ] && echo "td_attributes: $(TDX_TD_ATTRIBUTES)" || true; \
+	    [ -n "$(TDX_MR_TD)" ]         && echo "mr_td:         $(TDX_MR_TD)"         || true; \
+	    [ -n "$(TDX_XFAM)" ]          && echo "xfam:          $(TDX_XFAM)"          || true; \
+	    [ -n "$(TDX_RTMR_0)" ]        && echo "rtmr_0:        $(TDX_RTMR_0)"        || true; \
+	    [ -n "$(TDX_RTMR_1)" ]        && echo "rtmr_1:        $(TDX_RTMR_1)"        || true; \
+	    [ -n "$(TDX_RTMR_2)" ]        && echo "rtmr_2:        $(TDX_RTMR_2)"        || true; \
+	    [ -n "$(TDX_RTMR_3)" ]        && echo "rtmr_3:        $(TDX_RTMR_3)"        || true; \
+	fi; \
 	CURRENT_REF=$$(oc get configmap trusteeconfig-rvps-reference-values \
 	    -n trustee-operator-system \
 	    -o jsonpath='{.data.reference_value}' 2>/dev/null || echo '{}'); \
-	NEW_REF=$$(TDX_MR_SEAM="$(TDX_MR_SEAM)" TDX_TD_ATTRIBUTES="$(TDX_TD_ATTRIBUTES)" \
+	NEW_REF=$$(SNP_INIT_DATA_HASH="$$SNP_INIT_DATA_HASH" SNP_MEASUREMENT="$(SNP_MEASUREMENT)" SNP_BOOTLOADER="$(SNP_BOOTLOADER)" \
+	    SNP_TEE_SVN="$(SNP_TEE_SVN)" SNP_SVN="$(SNP_SVN)" SNP_MICROCODE="$(SNP_MICROCODE)" \
+	    TDX_MR_SEAM="$(TDX_MR_SEAM)" TDX_TD_ATTRIBUTES="$(TDX_TD_ATTRIBUTES)" \
 	    TDX_MR_TD="$(TDX_MR_TD)" TDX_XFAM="$(TDX_XFAM)" \
 	    TDX_RTMR_0="$(TDX_RTMR_0)" TDX_RTMR_1="$(TDX_RTMR_1)" \
 	    TDX_RTMR_2="$(TDX_RTMR_2)" TDX_RTMR_3="$(TDX_RTMR_3)" \
-	    python3 scripts/update-rvps.py "$$CURRENT_REF" "$$MR_CONFIG_ID"); \
+	    python3 scripts/update-rvps.py "$$CURRENT_REF" "$$BINDING_VALUE" $$RVPS_MODE_ARGS); \
 	PATCH=$$(echo "$$NEW_REF" | python3 -c 'import json,sys; print(json.dumps({"data":{"reference_value":sys.stdin.read().strip()}}))'); \
 	oc patch configmap trusteeconfig-rvps-reference-values \
 	    -n trustee-operator-system \
@@ -1613,7 +1673,16 @@ setup-attestation: set-rvps-values register-secrets-with-kbs
 
 .PHONY: patch-cpu-policy-initdata
 patch-cpu-policy-initdata:
-	@python3 attestation-policies/patch-cpu-mr-config-id.py | oc apply -f -
+	@set -e; \
+	AMD_SNP_NODE=$$(oc get nodes -l amd.feature.node.kubernetes.io/snp=true \
+	    -o name 2>/dev/null | head -n1); \
+	if [ -n "$$AMD_SNP_NODE" ]; then \
+	    echo "Binding AMD SEV-SNP CPU policy to the snp_init_data RVPS reference."; \
+	    POLICY_JSON=$$(python3 attestation-policies/patch-cpu-snp-init-data.py); \
+	else \
+	    POLICY_JSON=$$(python3 attestation-policies/patch-cpu-mr-config-id.py); \
+	fi; \
+	printf '%s\n' "$$POLICY_JSON" | oc apply -f -
 	@echo "Restarting Trustee to pick up the updated CPU attestation policy..."
 	@oc rollout restart deployment/trustee-deployment -n trustee-operator-system
 	@oc rollout status deployment/trustee-deployment -n trustee-operator-system --timeout=2m
@@ -1663,20 +1732,37 @@ show-rvps:
 	    echo "Error: trusteeconfig-https-cert-secret not found — run make setup-trustee-in-cluster first"; exit 1; \
 	}; \
 	KBS_SVC_URL="https://kbs-service.trustee-operator-system.svc.cluster.local:8080"; \
-	MR_CONFIG_ID=$$(oc get secret trusteeconfig-https-cert-secret -n trustee-operator-system \
-	    -o jsonpath='{.data.certificate}' | base64 -d \
-	    | python3 scripts/build-initdata.py "$$KBS_SVC_URL" "$(NAMESPACE)" --mr-config-id \
-	        --policy-mode $(POLICY_MODE) \
-	        --app-image $(APP_IMG) \
-	        --model-image $(MODEL_IMG)); \
 	CURRENT=$$(oc get configmap trusteeconfig-rvps-reference-values \
 	    -n trustee-operator-system \
 	    -o jsonpath='{.data.reference_value}' 2>/dev/null || echo '{}'); \
+	AMD_SNP_NODE=$$(oc get nodes -l amd.feature.node.kubernetes.io/snp=true \
+	    -o name 2>/dev/null | head -n1); \
+	AMD_ARGS=; \
+	[ -z "$$AMD_SNP_NODE" ] || AMD_ARGS=--amd; \
+	BINDING_VALUE=-; \
+	SNP_INIT_DATA_HASH=; \
+	if [ "$$AMD_ARGS" = --amd ]; then \
+	    SNP_INIT_DATA_HASH=$$(oc get secret trusteeconfig-https-cert-secret \
+	        -n trustee-operator-system \
+	        -o jsonpath='{.data.certificate}' | base64 -d \
+	        | python3 scripts/build-initdata.py "$$KBS_SVC_URL" "$(NAMESPACE)" \
+	            --init-data-hash --policy-mode $(POLICY_MODE) \
+	            --app-image $(APP_IMG) --model-image $(MODEL_IMG)); \
+	else \
+	    BINDING_VALUE=$$(oc get secret trusteeconfig-https-cert-secret \
+	        -n trustee-operator-system \
+	        -o jsonpath='{.data.certificate}' | base64 -d \
+	        | python3 scripts/build-initdata.py "$$KBS_SVC_URL" "$(NAMESPACE)" --mr-config-id \
+	            --policy-mode $(POLICY_MODE) \
+	            --app-image $(APP_IMG) --model-image $(MODEL_IMG)); \
+	fi; \
+	SNP_INIT_DATA_HASH="$$SNP_INIT_DATA_HASH" SNP_MEASUREMENT="$(SNP_MEASUREMENT)" SNP_BOOTLOADER="$(SNP_BOOTLOADER)" \
+	SNP_TEE_SVN="$(SNP_TEE_SVN)" SNP_SVN="$(SNP_SVN)" SNP_MICROCODE="$(SNP_MICROCODE)" \
 	TDX_MR_SEAM="$(TDX_MR_SEAM)" TDX_TD_ATTRIBUTES="$(TDX_TD_ATTRIBUTES)" \
 	TDX_MR_TD="$(TDX_MR_TD)" TDX_XFAM="$(TDX_XFAM)" \
 	TDX_RTMR_0="$(TDX_RTMR_0)" TDX_RTMR_1="$(TDX_RTMR_1)" \
 	TDX_RTMR_2="$(TDX_RTMR_2)" TDX_RTMR_3="$(TDX_RTMR_3)" \
-	python3 scripts/show-rvps.py "$$MR_CONFIG_ID" "$$CURRENT"
+	python3 scripts/show-rvps.py "$$BINDING_VALUE" "$$CURRENT" $$AMD_ARGS
 
 .PHONY: trustee-logs
 trustee-logs:

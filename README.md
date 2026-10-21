@@ -7,7 +7,7 @@ AI-powered classification from North Sea seismic data — run this quickstart wi
 - [Detailed description](#detailed-description)
   - [Who is this for?](#who-is-this-for)
   - [The business case for AI-driven seismic interpretation](#the-business-case-for-ai-driven-seismic-interpretation)
-  - [Why the cluster is not the security boundary](#why-the-cluster-is-not-the-security-boundary)
+  - [Why the cluster is no longer the security boundary](#why-the-cluster-is-no-longer-the-security-boundary)
   - [What this quickstart provides](#what-this-quickstart-provides)
   - [Architecture diagram](#architecture-diagram)
 - [Requirements](#requirements)
@@ -25,7 +25,7 @@ AI-powered classification from North Sea seismic data — run this quickstart wi
   - [Trustee setup — model owner (cluster-admin, once per cluster)](#trustee-setup--model-owner-cluster-admin-once-per-cluster)
     - [Install Trustee](#install-trustee)
     - [Patch default CPU policy to enforce initdata validation](#patch-default-cpu-policy-to-enforce-initdata-validation)
-    - [Patch default CPU policy to allow older firmware versions](#patch-default-cpu-policy-to-allow-older-firmware-versions)
+    - [Patch default CPU policy to allow older firmware versions (Intel Only)](#patch-default-cpu-policy-to-allow-older-firmware-versions-intel-only)
     - [Register RVPS reference values](#register-rvps-reference-values)
     - [Register app-specific secrets with KBS](#register-app-specific-secrets-with-kbs)
   - [Application deployment — application deployer (namespace admin)](#application-deployment--application-deployer-namespace-admin)
@@ -46,7 +46,7 @@ AI-powered classification from North Sea seismic data — run this quickstart wi
   - [Optional: Build and publish your own application — model owner](#optional-build-and-publish-your-own-application--model-owner)
   - [What you've accomplished](#what-youve-accomplished)
   - [Delete](#delete)
-- [Reference](#references)
+- [References](#references)
 - [Tags](#tags)
 
 ---
@@ -228,6 +228,9 @@ flowchart LR
 
 ### Minimum hardware requirements
 
+> **Platform support:** Use this quickstart on an all-Intel TDX cluster or an all-AMD SEV-SNP cluster. Mixed
+clusters are not supported by the quickstart.
+
 **Note:** It is recommended that this quickstart only be deployed in a cluster not being used concurrently for other deployments. Installation requires multiple node reboots and applies configuration that may be incompatible with deployments not using confidential containers.
 
 | Component | Minimum | Notes |
@@ -236,8 +239,6 @@ flowchart LR
 | CPU | Intel® Xeon Scalable 4th Gen+ (Sapphire Rapids or later) with TDX, or AMD EPYC 9004 series (Genoa) with SEV-SNP | TEE must be enabled in the BIOS. TDX was introduced in 4th Gen Xeon Scalable (Sapphire Rapids). |
 | RAM | 128GB | The kata VM takes 48GB, OCP control plane requires ~32GB, and GPU/OSC/Trustee system pods consume additional memory. |
 | Storage | 50GB | For OpenShift AI, OSC and trustee deployments|
-
-**NOTE:** At this point in time the quickstart has only been validated to work with Intel TDX; validation with AMD SEV-SNP is a work in progress.
 
 ### Minimum software requirements
 
@@ -368,8 +369,6 @@ Expected output includes `virt/tdx: BIOS enabled` and `virt/tdx: module initiali
 
 **AMD SEV-SNP (AMD EPYC)**
 
-**NOTE:** Support for AMD SEV-SNP is still a work in progress and has not be validated.
-
 Access the BIOS setup utility and enable SEV-SNP under the memory/security settings (path varies by server vendor — consult your server's BIOS reference manual). Verify with:
 
 ```bash
@@ -381,11 +380,15 @@ NODE=$(oc get nodes -l 'node-role.kubernetes.io/worker,!node-role.kubernetes.io/
     oc get nodes -l node-role.kubernetes.io/worker \
     -o jsonpath='{.items[0].metadata.name}')
 oc debug node/$NODE -- chroot /host journalctl -k | grep -i snp
+oc debug node/$NODE -- chroot /host cat /sys/module/kvm_amd/parameters/sev_snp
+oc debug node/$NODE -- chroot /host grep -o sev_snp /proc/cpuinfo | head -1
 ```
+
+The kernel log should include SEV-SNP initialization messages. The second command should print `Y`, confirming SEV-SNP is active in the `kvm_amd` module; `N` means it is inactive. The third command should print `sev_snp`, confirming the CPU exposes that capability. If the log has no SNP initialization messages, the module parameter is missing or `N`, or the CPU flag is absent, check that SEV-SNP is enabled in the BIOS and supported by the CPU.
 
 #### Apply kernel parameters
 
-The node must boot with TDX kernel parameters active before the OSC operator can install kata-cc. This step applies MachineConfigs and triggers a node reboot.
+The node must boot with the kernel parameters for its TEE platform active before the OSC operator can install kata-cc. This step applies MachineConfigs and triggers a node reboot.
 
 <details open>
 <summary>Make instructions</summary>
@@ -401,15 +404,13 @@ make setup-amd-tee      # AMD EPYC with SEV-SNP
 </details>
 
 <details>
-<summary>Manual instructions</summary>
+<summary>Manual instructions Intel</summary>
 
-To manually apply the TEE kernel parameters:
+To manually apply the Intel TDX and IOMMU kernel parameters:
 
 > **NOTE for multi-node clusters:** The MachineConfigs below use `role: master`. On multi-node clusters where kata workloads run on worker nodes, change `machineconfiguration.openshift.io/role: master` to `worker` in both blocks before applying.
 
-> **NOTE for AMD SEV-SNP clusters:** Skip the TDX block. Apply only the IOMMU block — SNP is enabled entirely via BIOS with no additional kernel parameters.
-
-Apply the TDX kernel parameters (Intel only):
+Apply the TDX kernel parameters:
 
 ```bash
 oc apply -f - <<'EOF'
@@ -472,7 +473,28 @@ oc wait mcp/master --for=condition=Updated=True --timeout=45m
 
 On single-node clusters, the API server itself reboots during this wait. Re-run it once the cluster is reachable again.
 
+</details>
 
+<details>
+<summary>Manual instructions AMD</summary>
+
+To manually apply the AMD SEV-SNP IOMMU kernel parameters:
+
+> **NOTE for multi-node clusters:** If `make setup-amd-tee` finds any nodes with the worker role but not the master role, it skips applying the AMD MachineConfig. The template targets `master` by default. If Kata workloads will run on workers, edit `helm/osc/templates/iommu-machine-config-amd.yaml` to set `machineconfiguration.openshift.io/role: worker`; otherwise, leave it targeting `master`. Then apply the MachineConfig manually as described below.
+
+Apply the AMD IOMMU parameters. This sets `amd_iommu=on`. It does not include `iommu=pt` as that disables SEV-SNP support in AMD's IOMMU driver:
+
+```bash
+oc apply -f helm/osc/templates/iommu-machine-config-amd.yaml
+```
+
+Wait for the node to reboot and return to Ready:
+
+```bash
+oc wait mcp/master --for=condition=Updated=True --timeout=20m
+```
+
+On single-node clusters, the API server itself reboots during this wait. Re-run it once the cluster is reachable again.
 </details>
 
 To validate all hardware and software prerequisites before proceeding:
@@ -480,6 +502,8 @@ To validate all hardware and software prerequisites before proceeding:
 ```bash
 make check-prereqs
 ```
+
+The sample below is from an Intel TDX cluster. On AMD SEV-SNP clusters, the CPU checks should identify SEV-SNP;
 
 Sample output:
 ```
@@ -508,8 +532,6 @@ Sample output:
   [PASS] cert-manager operator: installed
   [PASS] NVIDIA GPU Operator: installed
   [PASS] Node Feature Discovery: installed
-  [PASS] OpenShift Sandboxed Containers: installed
-  [PASS] Trustee operator: installed
 
 === TEE kernel parameters (MachineConfigs) ===
   [PASS] MachineConfig 99-enable-intel-tdx present (kvm_intel.tdx=1 + vsock-loopback)
@@ -521,10 +543,10 @@ Sample output:
   [PASS] TdxQuoteGenerationService: 1 QGS pod(s) running
 
 === Summary ===
-  PASS: 24   FAIL: 0   WARN: 0
+  PASS: 22   FAIL: 0   WARN: 0
 ```
 
-At this point, reports that Node Feature Discovery (NFD), OpenShift Sandboxed Containers (OSC), Trustee, or the Intel TDX DCAP components are not installed are expected. They are installed in later setup steps, so you can ignore those specific reports for now. Resolve other failures before proceeding.
+On AMD SEV-SNP clusters, Intel TDX DCAP checks are not applicable. Resolve other failures before proceeding.
 
 ---
 
@@ -572,6 +594,8 @@ After labeling GPU nodes, configure the GPU Operator for confidential computing 
 make setup-cc-gpu
 ```
 
+> **Note:** `setup-cc-gpu` waits for the `cc-manager` and `vfio-manager` pods to reach `Running`, then checks the GPU node's CC mode labels once. The labels themselves (`nvidia.com/cc.mode.state`, `nvidia.com/cc.ready.state`, `nvidia.com/gpu.deploy.*`) can take an additional **5–10 minutes** to populate after the pods are `Running`, since `cc-manager` has to run its own GPU detection routine first. If the labels still show `(MISSING)` right after the command completes, wait a few minutes and re-check with `make verify-gpu-passthrough` (safe to run repeatedly, read-only) before assuming something is wrong.
+
 </details>
 
 <details>
@@ -581,7 +605,7 @@ To manually install Kata containers:
 
 #### Step 1: Install Node Feature Discovery
 
-NFD labels cluster nodes with hardware capabilities (GPU, CPU features, and TEE type). Installing NFD after the TDX kernel parameters are active means it detects TDX immediately on first run. This is required for GPU workloads, for the `kata-cc-nvidia-gpu` runtimeClass that OSC creates, and for the OSC operator to detect which TEE platform is present.
+NFD labels cluster nodes with hardware capabilities (GPU, CPU features, and TEE type). Installing NFD after the platform-specific TEE kernel parameters are active means it detects the available TEE platform (Intel TDX or AMD SEV-SNP) immediately on first run. This is required for GPU workloads, for the `kata-cc-nvidia-gpu` runtimeClass that OSC creates, and for the OSC operator to detect which TEE platform is present.
 
 1. Go to **Operators → OperatorHub**
 2. Search for "Node Feature Discovery"
@@ -1148,7 +1172,7 @@ The Trustee operator creates a passthrough TLS Route named `kbs-route` automatic
 oc get route kbs-route -n trustee-operator-system -o jsonpath='{.spec.host}'
 ```
 
-Then increase the HAProxy timeout on the route. TDX attestation involves quote generation, PCCS certificate fetching, and quote verification — the full round trip can exceed HAProxy's default 30-second timeout, causing the connection to be cancelled before KBS responds:
+Then increase the HAProxy timeout on the route. Intel TDX attestation involves quote generation, PCCS certificate fetching, and quote verification. AMD SEV-SNP attestation may require fetching the VCEK from AMD KDS. These steps can make the full attestation round trip exceed HAProxy's default 30-second timeout, causing the connection to be cancelled before KBS responds:
 
 ```bash
 oc annotate route kbs-route -n trustee-operator-system \
@@ -1159,7 +1183,7 @@ oc annotate route kbs-route -n trustee-operator-system \
 
 #### Patch default CPU policy to enforce initdata validation
 
-The default Trustee CPU attestation policy verifies that the initdata provided with each attestation request is self-consistent with the TDX quote (i.e. `SHA256(initdata) == mr_config_id` in the quote). This binding check ensures the initdata was not tampered with in transit, but it does not verify that the initdata has any specific expected content. Without this patch, a pod that omits the exec-deny policy or uses a different KBS URL would still pass the configuration check and receive the model key.
+For Intel the default Trustee CPU attestation policy verifies that the initdata provided with each attestation request is self-consistent with the TDX quote (i.e. `SHA256(initdata) == mr_config_id` in the quote). This binding check ensures the initdata was not tampered with in transit, but it does not verify that the initdata has any specific expected content. Without this patch, a pod that omits the exec-deny policy or uses a different KBS URL would still pass the configuration check and receive the model key.
 
 This patch adds one line to the `configuration` block of the CPU attestation policy:
 
@@ -1169,17 +1193,22 @@ input.tdx.quote.body.mr_config_id in query_reference_value("mr_config_id")
 
 This requires that the `mr_config_id` value in the pod's TDX quote — which encodes the exact initdata the pod was launched with — matches one of the values registered in RVPS by `make set-rvps-values`. Any pod with different initdata (different KBS URL, certificate, namespace, or exec-deny policy) will fail the configuration check and be denied the key.
 
-<details open>
-<summary>Make instructions</summary>
+On AMD SEV-SNP, the equivalent binding uses the report's `HOST_DATA` field. Trustee exposes the verified initdata digest to the CPU attestation policy as `input.init_data`. `make set-rvps-values` computes the SHA-256 digest of the exact initdata generated for the selected namespace, policy mode, KBS certificate, and image repositories, then registers it as `snp_init_data`. The AMD branch of the policy patch adds this check to the SNP `executables` rule:
 
-```bash
-make patch-cpu-policy-initdata
+```rego
+input.init_data in query_reference_value("snp_init_data")
 ```
 
-</details>
+This requires that the `input.init_data` digest from the pod's SNP report — the SHA-256 digest of the exact initdata the pod was launched with — matches the `snp_init_data` value registered in RVPS by `make set-rvps-values`. A pod with different initdata (different KBS URL, certificate, namespace, image repositories, or exec-deny policy) will fail the configuration check and be denied the key. You may apply the policy before registering the value; key release remains denied until a matching `snp_init_data` value is registered.
+
+Run the same command on either platform to patch the policy:
+
+```bash
+make patch-cpu-policy-initdata NAMESPACE=$NAMESPACE
+```
 
 <details>
-<summary>Manual instructions</summary>
+<summary>Manual Intel instructions</summary>
 
 ```bash
 python3 attestation-policies/patch-cpu-mr-config-id.py | oc apply -f -
@@ -1189,9 +1218,20 @@ oc rollout status deployment/trustee-deployment -n trustee-operator-system --tim
 
 </details>
 
-#### Patch default CPU policy to allow older firmware versions
+<details>
+<summary>Manual AMD instructions</summary>
 
-The default Trustee CPU attestation policy requires `tcb_status == "UpToDate"` before it will set the hardware trustworthiness claim to affirming and release the model key. In practice, Intel issues TCB Recovery events on an irregular schedule, and a platform whose TCB was fully up to date when this quickstart was written may show `OutOfDate` by the time you run it because a newer TCB version has been published since the platform was last updated. In production this default makes sense, but for the quickstart we chose to patch the policy to allow TCB versions after a fixed date in order to minimize the chances you need to upgrade your firmware to run the quickstart.
+```bash
+python3 attestation-policies/patch-cpu-snp-init-data.py | oc apply -f -
+oc rollout restart deployment/trustee-deployment -n trustee-operator-system
+oc rollout status deployment/trustee-deployment -n trustee-operator-system --timeout=2m
+```
+
+</details>
+
+#### Patch default CPU policy to allow older firmware versions (Intel Only)
+
+The default Trustee Intel CPU attestation policy requires `tcb_status == "UpToDate"` before it will set the hardware trustworthiness claim to affirming and release the model key. In practice, Intel issues TCB Recovery events on an irregular schedule, and a platform whose TCB was fully up to date when this quickstart was written may show `OutOfDate` by the time you run it because a newer TCB version has been published since the platform was last updated. In production this default makes sense, but for the quickstart we chose to patch the policy to allow TCB versions after a fixed date in order to minimize the chances you need to upgrade your firmware to run the quickstart.
 
 The patched policy replaces the `UpToDate` requirement with a minimum acceptable TCB date (`2026-02-11`). Platforms certified to that TCB level or newer will pass the hardware check regardless of whether a more recent TCB has since been issued. The `tcb_date` is tied to a specific Intel TCB Recovery event and does not change unless the platform firmware is updated; it is therefore a stable, predictable condition to check against.
 
@@ -1219,8 +1259,9 @@ oc rollout status deployment/trustee-deployment -n trustee-operator-system --tim
 
 #### Register RVPS reference values
 
-The default trustee policy patched to add mr_config_id as covered in the earlier section verifies the following
-values in RVPS before it will release the model key. One of the set of registered RVPS values must match:
+`make set-rvps-values` detects the TEE platform from the node labels and registers the corresponding reference values. Intel TDX uses `mr_config_id` plus TDX measurements; AMD SEV-SNP uses `snp_init_data` plus the SNP launch and TCB values. The target merges new values into RVPS without removing values already registered for other namespaces or platforms, then restarts Trustee.
+
+For Intel TDX, the CPU policy verifies these values in RVPS before it releases the model key. One registered value for each checked claim must match:
 
 | Name | What it covers | Varies by |
 |---|---|---|
@@ -1238,14 +1279,25 @@ In addition it can be modified to validate the following values:
 | `rtmr_0` | UEFI firmware measurement | OSC version |
 | `rtmr_3` | Runtime configuration measurement | OSC version |
 
-In the quickstart, the `mr_config_id` is computed at registration time from the full initdata blob: it covers the KBS URL, KBS TLS certificate, namespace, app and model image repos, and the exec-deny policy (policy.rego). For the quickstart we have generated and captured the required values for the other entries for OSC 1.13.0 and included a make target that can be used to capture those values if you are using a different OSC version. For production deployments [veritas](https://github.com/confidential-devhub/veritas) is a tool that can help the model owner get the RVPS values needed without needing to have access to the application deployer's environment.
+In the quickstart, `mr_config_id` is computed at registration time from the full initdata blob: it covers the KBS URL, KBS TLS certificate, namespace, app and model image repositories, and the exec-deny policy (`policy.rego`). The other TDX values are captured for OSC **1.13.0**; use `make collect-tdx-measurements` to collect them for another OSC version. For production deployments, [veritas](https://github.com/confidential-devhub/veritas) can help the model owner obtain RVPS values without access to the application deployer's environment.
 
-In the quickstart we set all of the values when registering RVPS values. Any change to any of these requires re-running `make set-rvps-values`. The TDX hardware measurements are stable for a given OSC version — the Makefile already contains the correct values for OSC **1.13.0** (see the `TDX_MR_TD` block near `KATA_RUNTIME_CLASS` in the Makefile).
+For AMD SEV-SNP, `make set-rvps-values` registers these references. The patched CPU policy checks `snp_init_data` and `snp_launch_measurement`; the TCB values are also recorded in RVPS for SNP appraisal:
+
+| Name | What it covers | Varies by |
+|---|---|---|
+| `snp_init_data` | SHA-256 of the exact initdata, bound to the SNP report's `HOST_DATA` | Namespace, KBS URL or certificate, policy mode, app/model image repositories |
+| `snp_launch_measurement` | 48-byte SEV-SNP launch measurement | OSC version or guest boot image |
+| `snp_bootloader` | AMD PSP bootloader security version | Platform firmware |
+| `snp_tee_svn` | AMD PSP TEE security version | Platform firmware |
+| `snp_snp_svn` | SNP firmware security version | Platform firmware |
+| `snp_microcode` | Host CPU microcode version | BIOS or CPU microcode update |
+
+`make set-rvps-values` computes `snp_init_data` from the same initdata settings used by `make install`. Collect the five SNP launch and TCB values with `make collect-snp-measurements`; pass them to `make set-rvps-values` as shown below. Re-register values after the corresponding initdata, OSC, platform firmware, or microcode inputs change. The Makefile has defaults for both platforms, but use measurements collected from your target environment when its OSC version or AMD firmware differs from the recorded values.
 
 <details open>
 <summary>Make instructions</summary>
 
-To automatically register RVPS reference values:
+To automatically register RVPS reference values, run the same target for either platform. It detects AMD SEV-SNP from the `amd.feature.node.kubernetes.io/snp=true` node label. On AMD, provide the collected `SNP_*` values; on Intel, it uses the configured TDX values.
 
 ```bash
 make set-rvps-values NAMESPACE=$NAMESPACE
@@ -1254,7 +1306,7 @@ make set-rvps-values NAMESPACE=$NAMESPACE
 </details>
 
 <details>
-<summary>Manual instructions</summary>
+<summary>Manual Intel TDX instructions</summary>
 
 To manually register RVPS reference values:
 
@@ -1299,8 +1351,54 @@ oc rollout status deployment/trustee-deployment -n trustee-operator-system --tim
 
 </details>
 
+<details>
+<summary>Manual AMD SEV-SNP instructions</summary>
+
+Set `NAMESPACE`. The values below are the current Makefile defaults; for a different OSC version or AMD firmware, use the values from `make collect-snp-measurements NAMESPACE=$NAMESPACE`. Then run:
+
+```bash
+# Makefile defaults for OSC 1.20.1; replace with collected values when needed.
+SNP_MEASUREMENT='95eff3fcb7a26e5e91e6de1059dec9c17cfed8c5b5ea855d7fe019b694224b0033dcd471a1dc75973cdee9379ec0b83d'
+SNP_BOOTLOADER='7'
+SNP_TEE_SVN='0'
+SNP_SVN='23'
+SNP_MICROCODE='62'
+
+REGISTRY=${REGISTRY:-quay.io/rh-ai-quickstart}
+APP_IMG=${APP_IMG:-$REGISTRY/conf-gpu-accel-seismic-interp-deepseismic-app}
+MODEL_IMG=${MODEL_IMG:-$REGISTRY/conf-gpu-accel-seismic-interp-deepseismic-model}
+KBS_CERT=$(oc get secret trusteeconfig-https-cert-secret -n trustee-operator-system \
+    -o jsonpath='{.data.certificate}' | base64 -d)
+POLICY_MODE=${POLICY_MODE:-locked}
+SNP_INIT_DATA_HASH=$(echo "$KBS_CERT" | python3 scripts/build-initdata.py \
+    "https://kbs-service.trustee-operator-system.svc.cluster.local:8080" \
+    "$NAMESPACE" --init-data-hash \
+    --policy-mode "$POLICY_MODE" \
+    --app-image "$APP_IMG" \
+    --model-image "$MODEL_IMG")
+echo "snp_init_data: $SNP_INIT_DATA_HASH"
+
+CURRENT_REF=$(oc get configmap trusteeconfig-rvps-reference-values \
+    -n trustee-operator-system \
+    -o jsonpath='{.data.reference_value}' 2>/dev/null || echo '{}')
+NEW_REF=$(SNP_INIT_DATA_HASH="$SNP_INIT_DATA_HASH" \
+    SNP_MEASUREMENT="$SNP_MEASUREMENT" \
+    SNP_BOOTLOADER="$SNP_BOOTLOADER" SNP_TEE_SVN="$SNP_TEE_SVN" \
+    SNP_SVN="$SNP_SVN" SNP_MICROCODE="$SNP_MICROCODE" \
+    python3 scripts/update-rvps.py "$CURRENT_REF" - --amd)
+PATCH=$(echo "$NEW_REF" | python3 -c 'import json,sys; print(json.dumps({"data":{"reference_value":sys.stdin.read().strip()}}))')
+oc patch configmap trusteeconfig-rvps-reference-values \
+    -n trustee-operator-system --type merge -p "$PATCH"
+oc rollout restart deployment/trustee-deployment -n trustee-operator-system
+oc rollout status deployment/trustee-deployment -n trustee-operator-system --timeout=2m
+```
+
+`snp_init_data` is computed from the KBS certificate and the same namespace, policy mode, and image repositories used to create the application's initdata.
+
+</details>
+
 > **Using a different OSC version?** The OVMF firmware and kata kernel measurements change with each OSC release, so the values in the Makefile will not match your environment. To collect the correct values:
-> 1. Run `./scripts/collect-tdx-measurements.sh $NAMESPACE` — it launches a temporary kata-cc probe pod, extracts the measurements, and deletes the pod when done.
+> 1. Run `./scripts/collect-tdx-measurements.sh $NAMESPACE` or `make collect-snp-measurements NAMESPACE=$NAMESPACE` depending on your CPU — it launches a temporary kata-cc probe pod, extracts the measurements, and deletes the pod when done.
 > 2. The script prints the OSC version and a Makefile variable block.
 > 3. Paste the Makefile block into the Makefile (near `KATA_RUNTIME_CLASS`), update the OSC version comment, then run `make set-rvps-values NAMESPACE=$NAMESPACE` as normal.
 
@@ -1313,13 +1411,18 @@ make show-rvps NAMESPACE=$NAMESPACE
 
 This shows you what would be registered if you ran make `set-rvps-values` as well as a check against what
 has already been registered.
+The target detects the node's TEE type. On AMD SEV-SNP clusters, `show-rvps` displays the SNP
+measurement and TCB references instead of TDX fields; on Intel TDX clusters it displays the TDX fields,
+including `mr_seam` when supplied.
 
-You should see an output like the following where in the second section
-it indicates that all values match a registered value except for
-`mr_seam` that we have not registered for the quickstart because it
-would require that your firmware version match the exact value specified.
-For a production deployment you may want to set it for the maximum level
-of safety.
+On Intel TDX, the second section shows whether the computed values match the registered references.
+`mr_seam` is optional in this quickstart; it can be registered for a stricter firmware match.
+
+This shows you what would be registered if you ran make set-rvps-values as well as a check against what has already been registered.
+
+As an example on Intel you should see an output like the following where in the second section it indicates that all values match a registered
+value except for mr_seam that we have not registered for the quickstart because it would require that your firmware
+version match the exact value specified. For a production deployment you may want to set it for the maximum level of safety.
 ```
 ========================================================================
  RVPS REFERENCE VALUES
@@ -1455,7 +1558,9 @@ the set of allowed RVPS values you can run:
 make clear-rvps NAMESPACE=$NAMESPACE
 ```
 
-`mr_config_id` is a hash of the initdata — for the KBS to release a key, one of the registered RVPS sets must match including the `mr_config_id` with the hash of the initdata used when the pod was started. You can view the initdata that will be set when you deploy the application by running:
+`mr_config_id` (Intel TDX) and `snp_init_data` (AMD SEV-SNP) bind key release to the initdata used when the pod was started. Both are derived from the initdata's SHA-256 digest: TDX stores a padded digest in the quote's `mr_config_id`, while AMD checks the digest in the SNP report's `HOST_DATA` against the registered `snp_init_data` value. On either platform, the attested value must match a registered RVPS value for the KBS to release the key.
+
+To view the initdata and both computed values that will be used when you deploy the application, run:
 
 ```
 make show-initdata NAMESPACE=$NAMESPACE
@@ -1824,7 +1929,7 @@ On startup the pod goes through the following sequence inside the kata VM:
 
 2. **Init container `model-init`**: runs inside the kata VM — copies the encrypted ModelCar weights (`dutchf3_unet_final.pth.enc`) to the shared `/models-cache` volume.
 
-3. **Application container**: runs `decrypt.sh` first — CDH uses its KBS session (established via TDX + GPU attestation) to retrieve the model decryption key, which `decrypt.sh` uses to decrypt `.pth.enc` → `.pth` on the shared volume and then delete the key from local storage. The app then loads the plaintext model and starts the Gradio UI on port 7860.
+3. **Application container**: runs `decrypt.sh` first — CDH uses its KBS session (established via Intel TDX or AMD SEV-SNP, together with GPU attestation) to retrieve the model decryption key, which `decrypt.sh` uses to decrypt `.pth.enc` → `.pth` on the shared volume and then delete the key from local storage. The app then loads the plaintext model and starts the Gradio UI on port 7860.
 
 Wait for both init containers to complete and the app container to reach `Running` (this can take 5-10 minutes or so and the container may
 show with a CreateContainerError along the way):
@@ -1898,10 +2003,9 @@ Model ready.
 * To create a public link, set `share=True` in `launch()`.
 ```
 
-The key broker will only release the key if required attestation has passed. If you look higher up in the log
-you should see these two sections:
+The key broker will only release the key if required attestation has passed. The CPU evidence shown below is an Intel TDX example; AMD SEV-SNP reports SNP-specific CPU evidence instead. If you look higher up in the log you should see these two sections:
 
-CPU attestation
+CPU attestation (Intel TDX example)
 ```
 [OK ] cpu0 (status: affirming)
 Trustworthiness vector:
@@ -2045,7 +2149,7 @@ You can get the trustee logs by running
 make trustee-logs
 ```
 
-and you should see an entry like the following which shows that the kbs is refusing to return the image-policy which is needed to check the signatures on the containers. This is due to the attestation failure due to the mismatch between the registered initdata and what the container was started with:
+The following Trustee log is from an Intel TDX run. AMD SEV-SNP uses SNP-specific verifier output rather than the DCAP and MRCONFIGID checks shown here. The denial indicates that KBS is refusing to return the image-policy needed to check container signatures because the registered initdata does not match what the container was started with:
 
 ```
 2026-08-12T21:29:28.883027Z  INFO Intel TDX: verifier::tdx: Quote DCAP check succeeded.
@@ -2103,7 +2207,7 @@ in the logs for the app container:
 --- Key fetch failed, retrying in 5s ---
 ```
 
-checking the trustee logs with `make trustee-logs`
+checking the trustee logs with `make trustee-logs`. The following log is also from an Intel TDX run:
 
 ```
 2026-08-12T21:49:22.652521Z  INFO Intel TDX: verifier::tdx: Quote DCAP check succeeded.
@@ -2122,7 +2226,7 @@ checking the trustee logs with `make trustee-logs`
 
 we can see the request for the model key being denied.
 
-Going back to look at the earlier app logs, we can see that the CPU attestation failed:
+In this Intel TDX example, the earlier app logs show that CPU attestation failed:
 
 ```
     Trustworthiness vector:
@@ -2450,7 +2554,7 @@ Encrypts `dutchf3_unet_final.pth` with AES-256-CBC inside the container build (t
 Pushes the image to quay.io.
 
 **`make sign-modelcar`**
-Signs the pushed ModelCar image with your model owner private key for supply chain integrity — proving the model artifact has not been tampered with between publication and use. The same key is also used to sign the application image (see [Optional: Build and publish your own application](#optional-build-and-publish-your-own-application)), which is the signature that KBS verifies during attestation to decide whether to release the decryption key. Signing uses a `--signing-config` with no Rekor URLs so the signature is not recorded in the public Rekor transparency log — this is required for compatibility with image-rs's `keyPath`-only policy and avoids publishing signing events for private images to a public ledger.
+Signs the pushed ModelCar image with your model owner private key for supply chain integrity — proving the model artifact has not been tampered with between publication and use. The same key is also used to sign the application image (see [Optional: Build and publish your own application](#optional-build-and-publish-your-own-application--model-owner)), which is the signature that KBS verifies during attestation to decide whether to release the decryption key. Signing uses a `--signing-config` with no Rekor URLs so the signature is not recorded in the public Rekor transparency log — this is required for compatibility with image-rs's `keyPath`-only policy and avoids publishing signing events for private images to a public ledger.
 
 #### After publishing
 
@@ -2482,7 +2586,7 @@ This is not required to run the quickstart. The steps below are for model owners
 - `podman` or `docker`
 - `podman login quay.io` authenticated to a namespace where you can push
 - `cosign` 3.1.2+
-- A model owner key pair in `model-owner-verification-keys/` — generate one with `make generate-model-owner-keys` if you have not already done so (see [Optional: Encrypt and publish your own model](#optional-encrypt-and-publish-your-own-model))
+- A model owner key pair in `model-owner-verification-keys/` — generate one with `make generate-model-owner-keys` if you have not already done so (see [Optional: Encrypt and publish your own model](#optional-encrypt-and-publish-your-own-model--model-owner))
 
 #### Step 1: Build the application image
 
@@ -2553,7 +2657,7 @@ oc delete project $NAMESPACE
 
 The KataConfig, NFD, OSC, Trustee operator, Intel DCAP stack, MachineConfigs, and GPU operator CC mode are cluster-wide resources shared with other workloads. Only remove them if no other confidential workloads are running on the cluster:
 
-> **Warning:** Removing these resources will trigger multiple node reboots as MachineConfigs are unapplied and the IOMMU and TDX kernel parameters are removed. Do not proceed if the cluster is in active use for any other workloads.
+> **Warning:** Removing these resources will trigger multiple node reboots as MachineConfigs are unapplied and the platform-specific IOMMU and TEE kernel parameters are removed. Do not proceed if the cluster is in active use for any other workloads.
 
 ```bash
 # Only run if no other confidential workloads exist on the cluster
@@ -2570,7 +2674,8 @@ oc delete namespace intel-dcap
 # Kata / OSC
 oc delete kataconfig example-kataconfig
 oc delete machineconfig 99-enable-intel-tdx
-oc delete machineconfig 100-iommu-kernel-args
+oc delete machineconfig 100-iommu-kernel-args --ignore-not-found
+oc delete machineconfig 101-iommu-kernel-args-amd --ignore-not-found
 oc delete kubeletconfig kata-runtime-request-timeout
 oc delete nodefeaturerules.nfd.openshift.io tdx-features -n openshift-nfd --ignore-not-found
 oc delete nodefeaturerules.nfd.k8s-sigs.io tdx-features -n openshift-nfd --ignore-not-found
